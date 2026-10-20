@@ -35,7 +35,7 @@ var HTTPClient = &http.Client{
 		MaxIdleConnsPerHost:   64,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 35 * time.Second,
+		ResponseHeaderTimeout: 180 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		DisableCompression:    true,
 	},

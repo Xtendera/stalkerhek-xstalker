@@ -2,30 +2,47 @@ package webui
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
+	"math"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/kidpoleon/stalkerhek/filterstore"
 	"github.com/kidpoleon/stalkerhek/stalker"
 )
 
-const (
-	xtreamPassword   = "stalkerhek"
-	maxVODPagesFetch = 50
-)
+const maxVODPagesFetch = 0 // 0 = no limit
+
+// xtreamPassword is the password Xtream clients must send. Override with
+// STALKERHEK_XTREAM_PASSWORD (recommended before exposing the port to the internet).
+var xtreamPassword = func() string {
+	if v := strings.TrimSpace(os.Getenv("STALKERHEK_XTREAM_PASSWORD")); v != "" {
+		return v
+	}
+	return "stalkerhek"
+}()
 
 // RegisterXtreamHandlers exposes Xtream Codes API and playback paths for IPTV apps.
 func RegisterXtreamHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/player_api.php", handleXtreamPlayerAPI)
 	mux.HandleFunc("/panel_api.php", handleXtreamPlayerAPI)
 	mux.HandleFunc("/xtream/", handleXtreamRoute)
-	mux.HandleFunc("/movie/", handleXtreamMovie)
-	mux.HandleFunc("/series/", handleXtreamSeries)
+	mux.HandleFunc("/movie/", logPlay(handleXtreamMovie))
+	mux.HandleFunc("/series/", logPlay(handleXtreamSeries))
 	mux.HandleFunc("/live/", handleXtreamLive)
+	mux.HandleFunc("/iptv/", handleHLSForward)
+	mux.HandleFunc("/logo/", handleHLSForward)
 }
 
 func handleXtreamPlayerAPI(w http.ResponseWriter, r *http.Request) {
@@ -84,6 +101,8 @@ func dispatchXtreamAction(w http.ResponseWriter, r *http.Request, profileID int)
 		serveXtreamVODCategories(w, profileID, true)
 	case "get_series":
 		serveXtreamSeries(w, r, profileID)
+	case "get_vod_info":
+		serveXtreamVODInfo(w, r)
 	case "get_series_info":
 		serveXtreamSeriesInfo(w, r, profileID)
 	case "get_short_epg", "get_simple_data_table":
@@ -123,7 +142,7 @@ func validateXtreamAuth(profileID int, r *http.Request) bool {
 
 func validateXtreamPassword(pass string) bool {
 	pass = strings.TrimSpace(pass)
-	return pass == "" || pass == xtreamPassword
+	return pass == xtreamPassword
 }
 
 func normalizeMAC(mac string) string {
@@ -298,7 +317,7 @@ func serveXtreamVODCategories(w http.ResponseWriter, profileID int, series bool)
 		return
 	}
 	var out []map[string]any
-	for _, c := range cats {
+	for _, c := range filterVODCategories(cats) {
 		out = append(out, map[string]any{
 			"category_id":   c.ID,
 			"category_name": c.Title,
@@ -308,6 +327,93 @@ func serveXtreamVODCategories(w http.ResponseWriter, profileID int, series bool)
 	writeJSON(w, out)
 }
 
+// xtreamAllCache holds the merged "every category" listing that clients such as
+// TiviMate request in one call (the portal itself has no "all" category).
+var (
+	xtreamAllMu    sync.Mutex
+	xtreamAllCache = map[string]xtreamAllEntry{}
+)
+
+type xtreamAllEntry struct {
+	data    []map[string]any
+	updated time.Time
+}
+
+// xtreamAll returns the cached aggregate listing for key, building it on first
+// use. The cache never expires on its own: it is rebuilt by the scheduled sync
+// (see sync.go) so a refresh can't interrupt viewing at a random time.
+func xtreamAll(key string, cats []stalker.VODCategory, fetch func(cat string) []map[string]any) []map[string]any {
+	xtreamAllMu.Lock()
+	defer xtreamAllMu.Unlock()
+	if e, ok := xtreamAllCache[key]; ok {
+		return e.data
+	}
+	out := xtreamBuild(key, cats, fetch)
+	if len(out) > 0 {
+		xtreamAllCache[key] = xtreamAllEntry{data: out, updated: time.Now()}
+	}
+	return out
+}
+
+// xtreamRefresh rebuilds a listing without blocking readers of the old one and
+// swaps it in only when the rebuild produced data.
+func xtreamRefresh(key string, cats []stalker.VODCategory, fetch func(cat string) []map[string]any) int {
+	out := xtreamBuild(key, cats, fetch)
+	if len(out) == 0 {
+		log.Printf("[SYNC] %s: rebuild returned nothing, keeping previous data", strings.TrimRightFunc(key, func(r rune) bool { return r >= '0' && r <= '9' }))
+		return 0
+	}
+	xtreamAllMu.Lock()
+	xtreamAllCache[key] = xtreamAllEntry{data: out, updated: time.Now()}
+	xtreamAllMu.Unlock()
+	return len(out)
+}
+
+func xtreamBuild(key string, cats []stalker.VODCategory, fetch func(cat string) []map[string]any) []map[string]any {
+	results := make([][]map[string]any, len(cats))
+	label := strings.TrimRightFunc(key, func(r rune) bool { return r >= '0' && r <= '9' })
+	started := time.Now()
+	totalCats := 0
+	for _, c := range cats {
+		if c.ID != "*" {
+			totalCats++
+		}
+	}
+	var doneCats, doneItems int64
+	log.Printf("[SYNC] %s: started, %d categories", label, totalCats)
+	sem := make(chan struct{}, 6)
+	var wg sync.WaitGroup
+	for i, c := range cats {
+		if c.ID == "*" {
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, id string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			results[i] = fetch(id)
+			n := atomic.AddInt64(&doneCats, 1)
+			items := atomic.AddInt64(&doneItems, int64(len(results[i])))
+			if n%5 == 0 || int(n) == totalCats {
+				log.Printf("[SYNC] %s: %d/%d categories (%d%%), %d items, %s elapsed", label, n, totalCats, int(n)*100/totalCats, items, time.Since(started).Round(time.Second))
+			}
+		}(i, c.ID)
+	}
+	wg.Wait()
+	out := []map[string]any{}
+	for _, r := range results {
+		out = append(out, r...)
+	}
+	for i, m := range out {
+		m["num"] = i + 1
+	}
+	log.Printf("[SYNC] %s: FINISHED, %d items in %s", label, len(out), time.Since(started).Round(time.Second))
+	return out
+}
+
+func isAllCategory(c string) bool { return c == "" || c == "*" }
+
 func serveXtreamVODStreams(w http.ResponseWriter, r *http.Request, profileID int) {
 	portal, ok := GetProfilePortal(profileID)
 	if !ok {
@@ -315,8 +421,14 @@ func serveXtreamVODStreams(w http.ResponseWriter, r *http.Request, profileID int
 		return
 	}
 	cat := strings.TrimSpace(r.URL.Query().Get("category_id"))
-	if cat == "" {
-		writeJSON(w, []any{})
+	if isAllCategory(cat) {
+		cats, err := portal.GetVODCategories()
+		if err != nil {
+			log.Printf("[XTREAM] profile=%d vod categories err=%v", profileID, err)
+			writeJSON(w, []any{})
+			return
+		}
+		writeJSON(w, xtreamAll(fmt.Sprintf("vod%d", profileID), filterVODCategories(cats), vodFetcher(profileID, portal)))
 		return
 	}
 	items, err := portal.FetchAllVODMovies(cat, maxVODPagesFetch)
@@ -333,6 +445,33 @@ func serveXtreamVODStreams(w http.ResponseWriter, r *http.Request, profileID int
 	writeJSON(w, xtreamMovieItems(user, items, cat))
 }
 
+func xtreamSeriesItems(items []stalker.VODItem, cat string) []map[string]any {
+	var out []map[string]any
+	for i, it := range items {
+		seriesMeta.Store(it.ID, it)
+		out = append(out, map[string]any{
+			"num":              i + 1,
+			"name":             it.Name,
+			"series_id":        it.ID,
+			"cover":            it.Logo,
+			"plot":             it.Description,
+			"cast":             it.Actors,
+			"director":         it.Director,
+			"genre":            it.Genres,
+			"releaseDate":      it.Year,
+			"last_modified":    addedOrZero(it.Added),
+			"rating":           it.Rating,
+			"rating_5based":    rating5(it.Rating),
+			"backdrop_path":    []string{},
+			"youtube_trailer":  "",
+			"episode_run_time": "",
+			"category_id":      cat,
+			"stream_type":      "series",
+		})
+	}
+	return out
+}
+
 func serveXtreamSeries(w http.ResponseWriter, r *http.Request, profileID int) {
 	portal, ok := GetProfilePortal(profileID)
 	if !ok {
@@ -340,8 +479,14 @@ func serveXtreamSeries(w http.ResponseWriter, r *http.Request, profileID int) {
 		return
 	}
 	cat := strings.TrimSpace(r.URL.Query().Get("category_id"))
-	if cat == "" {
-		writeJSON(w, []any{})
+	if isAllCategory(cat) {
+		cats, err := portal.GetSeriesCategories()
+		if err != nil {
+			log.Printf("[XTREAM] profile=%d series categories err=%v", profileID, err)
+			writeJSON(w, []any{})
+			return
+		}
+		writeJSON(w, xtreamAll(fmt.Sprintf("series%d", profileID), filterVODCategories(cats), seriesFetcher(portal)))
 		return
 	}
 	items, err := portal.FetchAllSeries(cat, maxVODPagesFetch)
@@ -350,28 +495,7 @@ func serveXtreamSeries(w http.ResponseWriter, r *http.Request, profileID int) {
 		writeJSON(w, []any{})
 		return
 	}
-	var out []map[string]any
-	for i, it := range items {
-		out = append(out, map[string]any{
-			"num":              i + 1,
-			"name":             it.Name,
-			"series_id":        it.ID,
-			"cover":            it.Logo,
-			"plot":             "",
-			"cast":             "",
-			"director":         "",
-			"genre":            "",
-			"releaseDate":      "",
-			"last_modified":    "",
-			"rating":           "",
-			"rating_5based":    0,
-			"backdrop_path":    []string{},
-			"youtube_trailer":  "",
-			"episode_run_time": "",
-			"category_id":      cat,
-			"stream_type":      "series",
-		})
-	}
+	out := xtreamSeriesItems(items, cat)
 	writeJSON(w, out)
 }
 
@@ -395,22 +519,39 @@ func serveXtreamSeriesInfo(w http.ResponseWriter, r *http.Request, profileID int
 		writeJSON(w, map[string]any{"seasons": []any{}, "info": map[string]any{}, "episodes": map[string]any{}})
 		return
 	}
+	var meta stalker.VODItem
+	if v, ok := seriesMeta.Load(seriesID); ok {
+		meta = v.(stalker.VODItem)
+	}
 	p, _ := GetProfile(profileID)
 	user := p.MAC
 	seasonList := make([]map[string]any, 0, len(seasons))
 	episodes := map[string][]map[string]any{}
-	for _, sn := range seasons {
+	// Portal season ids are opaque (e.g. 209540); clients want 1,2,3... in order.
+	sort.SliceStable(seasons, func(a, b int) bool {
+		na, nb := leadingNumber(seasons[a].Name), leadingNumber(seasons[b].Name)
+		if na != nb {
+			return na < nb
+		}
+		return false
+	})
+	for si, sn := range seasons {
 		sid := sn.SeasonID
 		if sid == "" {
 			sid = sn.ID
 		}
+		snum := leadingNumber(sn.Name)
+		if snum <= 0 {
+			snum = si + 1
+		}
+		skey := strconv.Itoa(snum)
 		seasonList = append(seasonList, map[string]any{
 			"air_date":      "",
 			"episode_count": 0,
 			"id":            sid,
 			"name":          sn.Name,
 			"overview":      "",
-			"season_number": sid,
+			"season_number": snum,
 			"cover":         sn.Logo,
 			"cover_big":     sn.Logo,
 		})
@@ -424,7 +565,8 @@ func serveXtreamSeriesInfo(w http.ResponseWriter, r *http.Request, profileID int
 			if epNum == "" {
 				epNum = ep.ID
 			}
-			ext := extOrDefault(ep.ContainerExt, "mp4")
+			ext := extOrDefault(ep.ContainerExt, "m3u8")
+			rememberEpisode(profileID, ep.ID, seriesID, sid, epNum)
 			epOut = append(epOut, map[string]any{
 				"id":                  ep.ID,
 				"episode_num":         epNum,
@@ -432,17 +574,26 @@ func serveXtreamSeriesInfo(w http.ResponseWriter, r *http.Request, profileID int
 				"container_extension": ext,
 				"info":                map[string]any{},
 				"custom_sid":          "",
-				"added":               "0",
-				"season":              sid,
+				"added":               addedOrZero(meta.Added),
+				"season":              snum,
 				"direct_source":       "",
 			})
 			_ = user
 		}
-		episodes[sid] = epOut
+		sort.SliceStable(epOut, func(a, b int) bool {
+			return atoiSafe(fmt.Sprint(epOut[a]["episode_num"])) < atoiSafe(fmt.Sprint(epOut[b]["episode_num"]))
+		})
+		episodes[skey] = epOut
 	}
+	flushEpisodes()
 	writeJSON(w, map[string]any{
 		"seasons":  seasonList,
-		"info":     map[string]any{"name": "", "cover": "", "plot": ""},
+		"info": map[string]any{
+			"name": meta.Name, "cover": meta.Logo, "plot": meta.Description, "cast": meta.Actors,
+			"director": meta.Director, "genre": meta.Genres, "releaseDate": meta.Year,
+			"last_modified": addedOrZero(meta.Added), "rating": meta.Rating,
+			"rating_5based": rating5(meta.Rating), "backdrop_path": []string{}, "youtube_trailer": "",
+		},
 		"episodes": episodes,
 	})
 }
@@ -487,19 +638,37 @@ func serveXtreamShortEPG(w http.ResponseWriter, r *http.Request, profileID int) 
 	writeJSON(w, map[string]any{"epg_listings": listings})
 }
 
+var seriesMeta sync.Map // series id / "m"+movie id -> stalker.VODItem
+
+func addedOrZero(a string) string {
+	if a == "" {
+		return "0"
+	}
+	return a
+}
+
+func rating5(r string) float64 {
+	f, err := strconv.ParseFloat(r, 64)
+	if err != nil {
+		return 0
+	}
+	return math.Round(f/2*10) / 10
+}
+
 func xtreamMovieItems(user string, items []stalker.VODItem, cat string) []map[string]any {
 	var out []map[string]any
 	for i, it := range items {
-		ext := extOrDefault(it.ContainerExt, "mp4")
+		ext := extOrDefault(it.ContainerExt, "m3u8")
+		seriesMeta.Store("m"+it.ID, it)
 		out = append(out, map[string]any{
 			"num":                 i + 1,
 			"name":                it.Name,
 			"stream_type":         "movie",
 			"stream_id":           it.ID,
 			"stream_icon":         it.Logo,
-			"rating":              "",
-			"rating_5based":       0,
-			"added":               "0",
+			"rating":              it.Rating,
+			"rating_5based":       rating5(it.Rating),
+			"added":               addedOrZero(it.Added),
 			"category_id":         cat,
 			"container_extension": ext,
 			"custom_sid":          "",
@@ -549,6 +718,26 @@ func playXtreamVOD(w http.ResponseWriter, r *http.Request, linkType string) {
 	var err error
 	if cmd := strings.TrimSpace(r.URL.Query().Get("cmd")); cmd != "" {
 		pl, err = portal.CreateVODPlayLink(cmd, linkType, seriesNum)
+	} else if ei, epID, ok := resolveEpisode(pid, streamID); ok && linkType == "series" {
+		if ei.Num == "" { // entry saved before episode numbers were tracked
+			if eps, e := portal.FetchAllEpisodes(ei.Series, ei.Season, 0); e == nil {
+				for _, x := range eps {
+					if x.ID == epID {
+						ei.Num = x.EpisodeNumber
+						rememberEpisode(pid, epID, ei.Series, ei.Season, ei.Num)
+						flushEpisodes()
+					}
+				}
+			}
+		}
+		fid := portal.LookupEpisodeFileID(ei.Series, ei.Season, epID)
+		if fid == "" {
+			err = fmt.Errorf("no file for episode (series=%s season=%s)", ei.Series, ei.Season)
+		} else {
+			// The portal serves episode 1 for any file id unless told which
+			// episode of the season file is wanted via "series".
+			pl, err = portal.CreateVODPlayLink("/media/file_"+fid+".mpg", linkType, ei.Num)
+		}
 	} else {
 		pl, err = portal.CreateVODPlayLinkByID(streamID, linkType, seriesNum)
 	}
@@ -594,7 +783,159 @@ func handleXtreamLive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	scheme, host := requestSchemeHost(r)
-	redirect := scheme + "://" + host + ":" + strconv.Itoa(p.HlsPort) + "/iptv/" + url.PathEscape(title)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	hostPort := host + ":" + strconv.Itoa(p.HlsPort)
+	if viaProxy(r) {
+		// Tunnel (ngrok etc.): only the main port is reachable, which forwards /iptv/.
+		hostPort = r.Header.Get("X-Forwarded-Host")
+		if hostPort == "" {
+			hostPort = r.Host
+		}
+	}
+	redirect := scheme + "://" + hostPort + "/iptv/" + url.PathEscape(title)
 	http.Redirect(w, r, redirect, http.StatusFound)
 }
 
+// Episode ids alone don't identify a file; the portal needs series+season too.
+// Xtream clients (TiviMate) want plain numeric episode ids, so the mapping is
+// remembered when get_series_info lists episodes and persisted across restarts.
+type episodeInfo struct {
+	Series string `json:"s"`
+	Season string `json:"n"`
+	Num    string `json:"e,omitempty"` // episode number within the season
+}
+
+var (
+	episodeMu     sync.RWMutex
+	episodeMap    = map[string]episodeInfo{}
+	episodeLoaded bool
+	episodeDirty  bool
+)
+
+func episodeFile() string { return filepath.Join(filepath.Dir(profilesFile), "episodes.json") }
+
+func loadEpisodesLocked() {
+	if episodeLoaded {
+		return
+	}
+	episodeLoaded = true
+	if b, err := os.ReadFile(episodeFile()); err == nil {
+		_ = json.Unmarshal(b, &episodeMap)
+	}
+}
+
+func rememberEpisode(profileID int, epID, series, season, num string) {
+	episodeMu.Lock()
+	loadEpisodesLocked()
+	k := fmt.Sprintf("%d/%s", profileID, epID)
+	if e, ok := episodeMap[k]; !ok || e.Series != series || e.Season != season || e.Num != num {
+		episodeMap[k] = episodeInfo{series, season, num}
+		episodeDirty = true
+	}
+	episodeMu.Unlock()
+}
+
+// flushEpisodes writes the mapping to disk if it changed.
+func flushEpisodes() {
+	episodeMu.Lock()
+	defer episodeMu.Unlock()
+	if !episodeDirty {
+		return
+	}
+	episodeDirty = false
+	if b, err := json.Marshal(episodeMap); err == nil {
+		_ = os.MkdirAll(filepath.Dir(episodeFile()), 0o755)
+		_ = os.WriteFile(episodeFile(), b, 0o644)
+	}
+}
+
+func resolveEpisode(profileID int, id string) (episodeInfo, string, bool) {
+	episodeMu.Lock()
+	loadEpisodesLocked()
+	e, ok := episodeMap[fmt.Sprintf("%d/%s", profileID, id)]
+	episodeMu.Unlock()
+	return e, id, ok
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	code int
+}
+
+func (s *statusRecorder) WriteHeader(c int) { s.code = c; s.ResponseWriter.WriteHeader(c) }
+
+// logPlay logs every VOD play request with its result so client-side errors
+// (e.g. a 404 in the player) can be matched to what the proxy answered.
+func logPlay(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, code: 200}
+		h(rec, r)
+		loc := rec.Header().Get("Location")
+		if len(loc) > 70 {
+			loc = loc[:70]
+		}
+		log.Printf("[XTREAM] %s %s?%s -> %d %s", r.Method, r.URL.Path, r.URL.RawQuery, rec.code, loc)
+	}
+}
+
+// leadingNumber returns the first integer in names like "Season 4. SHOW: Season 04"
+// or "Episode 13. ...", or 0 when there is none.
+func leadingNumber(name string) int {
+	n, started := 0, false
+	for _, c := range name {
+		if c >= '0' && c <= '9' {
+			n = n*10 + int(c-'0')
+			started = true
+		} else if started {
+			break
+		}
+	}
+	return n
+}
+
+func serveXtreamVODInfo(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("vod_id"))
+	v, ok := seriesMeta.Load("m" + id)
+	if !ok {
+		writeJSON(w, map[string]any{"info": map[string]any{}, "movie_data": map[string]any{}})
+		return
+	}
+	it := v.(stalker.VODItem)
+	writeJSON(w, map[string]any{
+		"info": map[string]any{
+			"name": it.Name, "o_name": it.Name, "movie_image": it.Logo, "cover_big": it.Logo,
+			"plot": it.Description, "description": it.Description, "cast": it.Actors, "actors": it.Actors,
+			"director": it.Director, "genre": it.Genres, "releasedate": it.Year,
+			"rating": it.Rating, "rating_5based": rating5(it.Rating), "backdrop_path": []string{},
+			"youtube_trailer": "", "duration": "", "duration_secs": 0,
+		},
+		"movie_data": map[string]any{
+			"stream_id": it.ID, "name": it.Name, "added": addedOrZero(it.Added),
+			"category_id": it.Category, "container_extension": extOrDefault(it.ContainerExt, "m3u8"),
+			"custom_sid": "", "direct_source": "",
+		},
+	})
+}
+
+func vodFetcher(profileID int, portal *stalker.Portal) func(string) []map[string]any {
+	p, _ := GetProfile(profileID)
+	return func(id string) []map[string]any {
+		items, err := portal.FetchAllVODMovies(id, maxVODPagesFetch)
+		if err != nil {
+			return nil
+		}
+		return xtreamMovieItems(p.MAC, items, id)
+	}
+}
+
+func seriesFetcher(portal *stalker.Portal) func(string) []map[string]any {
+	return func(id string) []map[string]any {
+		items, err := portal.FetchAllSeries(id, maxVODPagesFetch)
+		if err != nil {
+			return nil
+		}
+		return xtreamSeriesItems(items, id)
+	}
+}

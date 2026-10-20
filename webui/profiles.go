@@ -1033,6 +1033,20 @@ func RegisterProfileHandlers(mux *http.ServeMux, onStart func()) {
 			  <div class="hint">How long to wait for upstream response headers.</div>
 			</div>
 			<div class="stat">
+			  <div class="lbl">Movie/series catalogue</div>
+			  <select id="s_vodfilter" title="Languages: only English, Hindi and Gujarati categories (about half the titles, lighter for clients).&#10;All: every category the provider has.">
+				<option value="languages">English, Hindi &amp; Gujarati only</option>
+				<option value="all">All categories</option>
+			  </select>
+			  <div class="hint">Applies to the Xtream API. Clients must re-sync after changing it.</div>
+			</div>
+			<div class="stat">
+			  <div class="lbl">Catalogue sync times</div>
+			  <input id="s_sync" placeholder="03:00" title="Local times (24h, HH:MM, comma separated) when the movie/series list is refreshed from the provider.&#10;Leave empty to turn automatic sync off." />
+			  <div class="hint" id="syncinfo">Refreshes at these times only, never mid-day. Example: 03:00, 15:30</div>
+			  <button type="button" id="syncNow" class="ghost" style="margin-top:6px">Sync now</button>
+			</div>
+			<div class="stat">
 			  <div class="lbl">Max idle conns/host</div>
 			  <input id="s_idle" name="max_idle_conns_per_host" inputmode="numeric" placeholder="Default: 128" title="How many spare connections we keep ready.&#10;&#10;Default: 128&#10;Lower only if the host is memory-limited" />
 			  <div class="hint">Higher can improve concurrency.</div>
@@ -1432,6 +1446,34 @@ func RegisterProfileHandlers(mux *http.ServeMux, onStart func()) {
 		}catch(e){}
 	})();
 
+	(async function loadVODFilter(){
+		try{
+			const r=await fetch('/api/vodfilter');
+			if(!r.ok) return;
+			const f=await r.json();
+			const e=document.getElementById('s_vodfilter');
+			if(e && f.mode) e.value=f.mode;
+		}catch(e){}
+	})();
+	async function loadSync(){
+		try{
+			const r=await fetch('/api/sync');
+			if(!r.ok) return;
+			const f=await r.json();
+			const e=document.getElementById('s_sync');
+			if(e && document.activeElement!==e) e.value=(f.times||[]).join(', ');
+			const i=document.getElementById('syncinfo');
+			if(i) i.textContent=(f.running?'Sync running now. ':'')+(f.next?'Next: '+f.next+'. ':'Automatic sync off. ')+(f.last?'Last: '+f.last+' ('+f.last_message+')':'');
+		}catch(e){}
+	}
+	loadSync(); setInterval(loadSync, 15000);
+	document.getElementById('syncNow').addEventListener('click', async ()=>{
+		try{
+			const r=await postForm('/api/sync', {action:'now'});
+			if(r.ok) showToast('Sync started','See progress in the logs.'); else showToast('Sync','A sync is already running.');
+			loadSync();
+		}catch(e){ showToast('Sync','Could not start a sync.'); }
+	});
 	document.getElementById('saveSettings').addEventListener('click', async ()=>{
 		const delay=document.getElementById('s_delay').value||'';
 		const rht=document.getElementById('s_rht').value||'';
@@ -1442,6 +1484,10 @@ func RegisterProfileHandlers(mux *http.ServeMux, onStart func()) {
 				response_header_timeout_seconds: rht,
 				max_idle_conns_per_host: idle,
 			});
+			await postForm('/api/vodfilter', {mode: document.getElementById('s_vodfilter').value});
+			const sr=await postForm('/api/sync', {times: document.getElementById('s_sync').value});
+			loadSync();
+			if(!sr.ok){ const j=await sr.json().catch(()=>({})); showToast('Sync times not saved', j.error||'Use times like 03:00'); return; }
 			showToast('Saved', 'Settings applied.');
 		}catch(e){
 			showToast('Save failed', 'Could not save settings.');

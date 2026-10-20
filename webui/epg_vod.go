@@ -16,6 +16,7 @@ import (
 var (
 	portalXMLTVMu    sync.RWMutex
 	portalXMLTVCache = map[int]portalXMLTVEntry{}
+	portalXMLTVBuilding = map[int]bool{}
 )
 
 type portalXMLTVEntry struct {
@@ -139,6 +140,40 @@ func serveXMLTV(w http.ResponseWriter, r *http.Request, profileID int) {
 		}
 	}
 
+	// Building programmes takes minutes on large portals. Answer immediately with
+	// a channels-only guide and fill the cache in the background.
+	if includePrograms {
+		portalXMLTVMu.Lock()
+		building := portalXMLTVBuilding[profileID]
+		if !building {
+			portalXMLTVBuilding[profileID] = true
+		}
+		portalXMLTVMu.Unlock()
+		if !building {
+			go func() {
+				defer func() {
+					portalXMLTVMu.Lock()
+					delete(portalXMLTVBuilding, profileID)
+					portalXMLTVMu.Unlock()
+				}()
+				f := make(map[string]*stalker.Channel, len(chs))
+				for title, ch := range chs {
+					if ch != nil && filterstore.IsAllowed(profileID, ch) {
+						f[title] = ch
+					}
+				}
+				l := time.UTC
+				if portalOK && portal != nil {
+					l = portal.TimeLocation()
+				}
+				if d, err := stalker.BuildXMLTV(f, stalker.XMLTVOptions{IncludePrograms: true, ProgramLimit: limit, EPGSize: 8}, l); err == nil {
+					setPortalXMLTVCache(profileID, d)
+				}
+			}()
+		}
+		includePrograms = false
+	}
+
 	filtered := make(map[string]*stalker.Channel, len(chs))
 	for title, ch := range chs {
 		if ch != nil && filterstore.IsAllowed(profileID, ch) {
@@ -158,9 +193,6 @@ func serveXMLTV(w http.ResponseWriter, r *http.Request, profileID int) {
 		LogWarn("EPG", "build xmltv profile=%d err=%v", profileID, err)
 		http.Error(w, "failed to build epg", http.StatusInternalServerError)
 		return
-	}
-	if includePrograms {
-		setPortalXMLTVCache(profileID, data)
 	}
 	w.Header().Set("Content-Type", stalker.XMLTVContentType)
 	w.Header().Set("Cache-Control", "public, max-age=120")

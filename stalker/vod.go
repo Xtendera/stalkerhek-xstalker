@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/url"
 	"path"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // VODCategory is a movies/VOD grouping from the portal.
@@ -29,6 +33,13 @@ type VODItem struct {
 	SeasonID      string `json:"season_id,omitempty"`
 	EpisodeNumber string `json:"episode_number,omitempty"`
 	ContainerExt  string `json:"container_extension,omitempty"`
+	Added         string `json:"added,omitempty"`       // unix seconds
+	Rating        string `json:"rating,omitempty"`      // 0-10
+	Description   string `json:"description,omitempty"`
+	Director      string `json:"director,omitempty"`
+	Actors        string `json:"actors,omitempty"`
+	Year          string `json:"year,omitempty"`
+	Genres        string `json:"genres,omitempty"`
 }
 
 // VODPlayLink is a seekable on-demand URL (movie.php or direct stream).
@@ -242,18 +253,35 @@ type vodListParams struct {
 	seasons    bool
 }
 
+// vodPageSem bounds concurrent portal list requests across all categories.
+var vodPageSem = make(chan struct{}, 8)
+
+func (p *Portal) getPageRetry(prm vodListParams) (items []VODItem, total, perPage int, err error) {
+	for try := 0; try < 3; try++ {
+		vodPageSem <- struct{}{}
+		items, total, perPage, err = p.getOrderedListPP(prm)
+		<-vodPageSem
+		if err == nil {
+			return
+		}
+		time.Sleep(time.Duration(try+1) * 300 * time.Millisecond)
+	}
+	return
+}
+
+// fetchAllOrderedPages loads every page (portal pages are 1-based; p=0 repeats page 1).
+// maxPages <= 0 means no limit.
 func (p *Portal) fetchAllOrderedPages(prm vodListParams, maxPages int) ([]VODItem, error) {
-	prm.page = 0
-	first, total, err := p.getOrderedList(prm)
+	prm.page = 1
+	first, total, perPage, err := p.getPageRetry(prm)
 	if err != nil {
 		return nil, err
 	}
 	if len(first) == 0 && total == 0 {
 		return first, nil
 	}
-	perPage := len(first)
-	if perPage == 0 {
-		perPage = 1
+	if perPage <= 0 {
+		perPage = 14
 	}
 	totalPages := (total + perPage - 1) / perPage
 	if totalPages < 1 {
@@ -262,9 +290,31 @@ func (p *Portal) fetchAllOrderedPages(prm vodListParams, maxPages int) ([]VODIte
 	if maxPages > 0 && totalPages > maxPages {
 		totalPages = maxPages
 	}
-	seen := make(map[string]struct{}, len(first))
+	pages := make([][]VODItem, totalPages+1)
+	pages[1] = first
+	var wg sync.WaitGroup
+	var errCount int32
+	for page := 2; page <= totalPages; page++ {
+		wg.Add(1)
+		go func(page int) {
+			defer wg.Done()
+			q := prm
+			q.page = page
+			items, _, _, err := p.getPageRetry(q)
+			if err != nil {
+				atomic.AddInt32(&errCount, 1)
+				return
+			}
+			pages[page] = items
+		}(page)
+	}
+	wg.Wait()
+	if errCount > 0 {
+		log.Printf("[VOD] category %q: %d of %d pages failed after retries", prm.categoryID, errCount, totalPages)
+	}
+	seen := make(map[string]struct{}, total)
 	out := make([]VODItem, 0, total)
-	add := func(list []VODItem) {
+	for _, list := range pages {
 		for _, it := range list {
 			k := it.ID + "|" + it.CMD
 			if _, ok := seen[k]; ok {
@@ -274,22 +324,15 @@ func (p *Portal) fetchAllOrderedPages(prm vodListParams, maxPages int) ([]VODIte
 			out = append(out, it)
 		}
 	}
-	add(first)
-	for page := 1; page < totalPages; page++ {
-		prm.page = page
-		items, _, err := p.getOrderedList(prm)
-		if err != nil {
-			break
-		}
-		if len(items) == 0 {
-			break
-		}
-		add(items)
-	}
 	return out, nil
 }
 
 func (p *Portal) getOrderedList(prm vodListParams) ([]VODItem, int, error) {
+	items, total, _, err := p.getOrderedListPP(prm)
+	return items, total, err
+}
+
+func (p *Portal) getOrderedListPP(prm vodListParams) ([]VODItem, int, int, error) {
 	if prm.page < 0 {
 		prm.page = 0
 	}
@@ -313,33 +356,73 @@ func (p *Portal) getOrderedList(prm vodListParams) ([]VODItem, int, error) {
 	link := p.Location + "?" + q.Encode()
 	content, err := p.httpRequest(link)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
-	return parseVODList(content, prm)
+	items, total, perPage, err := parseVODListPP(content, prm)
+	for i := range items {
+		items[i].Logo = p.absoluteImageURL(items[i].Logo)
+	}
+	return items, total, perPage, err
+}
+
+// absoluteImageURL turns the portal's relative poster paths
+// ("/stalker_portal/screenshots/...") into URLs clients can fetch; the portal
+// serves them publicly. "false"/empty means no poster.
+func (p *Portal) absoluteImageURL(img string) string {
+	img = strings.TrimSpace(img)
+	if img == "" || img == "false" || img == "null" || strings.HasPrefix(img, "http") {
+		if img == "false" || img == "null" {
+			return ""
+		}
+		return img
+	}
+	u, err := url.Parse(p.Location)
+	if err != nil || u.Host == "" {
+		return img
+	}
+	if !strings.HasPrefix(img, "/") {
+		img = "/" + img
+	}
+	return u.Scheme + "://" + u.Host + img
 }
 
 func parseVODList(content []byte, prm vodListParams) ([]VODItem, int, error) {
+	items, total, _, err := parseVODListPP(content, prm)
+	return items, total, err
+}
+
+// parseVODListPP also returns the portal's page size (max_page_items), 0 if unknown.
+func parseVODListPP(content []byte, prm vodListParams) ([]VODItem, int, int, error) {
+	var lastPerPage int
 	var wrap struct {
 		Js json.RawMessage `json:"js"`
 	}
 	if err := json.Unmarshal(content, &wrap); err != nil {
-		return nil, 0, fmt.Errorf("vod list: invalid response: %w", err)
+		return nil, 0, 0, fmt.Errorf("vod list: invalid response: %w", err)
 	}
 	js := bytes.TrimSpace(wrap.Js)
 	if len(js) == 0 {
-		return nil, 0, nil
+		return nil, 0, 0, nil
 	}
 
 	type row struct {
 		ID           interface{} `json:"id"`
-		Name         string      `json:"name"`
-		CMD          string      `json:"cmd"`
-		Logo         string      `json:"screenshot_uri"`
+		Name         flexString  `json:"name"`
+		CMD          flexString  `json:"cmd"`
+		Logo         flexString  `json:"screenshot_uri"`
 		IsSeries     interface{} `json:"is_series"`
 		IsSeason     interface{} `json:"is_season"`
 		VideoID      interface{} `json:"video_id"`
 		SeriesNumber interface{} `json:"series_number"`
-		ContainerExt string      `json:"container_extension"`
+		ContainerExt flexString  `json:"container_extension"`
+		Added        flexString  `json:"added"`
+		RatingIMDB   flexString  `json:"rating_imdb"`
+		RatingKP     flexString  `json:"rating_kinopoisk"`
+		Description  flexString  `json:"description"`
+		Director     flexString  `json:"director"`
+		Actors       flexString  `json:"actors"`
+		Year         flexString  `json:"year"`
+		GenresStr    flexString  `json:"genres_str"`
 	}
 
 	var rows []row
@@ -347,16 +430,18 @@ func parseVODList(content []byte, prm vodListParams) ([]VODItem, int, error) {
 
 	// Payload shape: { "data": [...], "total_items": N }
 	var payload struct {
-		TotalItems interface{} `json:"total_items"`
-		Data       []row       `json:"data"`
+		TotalItems   interface{} `json:"total_items"`
+		MaxPageItems interface{} `json:"max_page_items"`
+		Data         []row       `json:"data"`
 	}
 	if err := json.Unmarshal(js, &payload); err == nil && (len(payload.Data) > 0 || payload.TotalItems != nil) {
 		rows = payload.Data
 		total = atoiFlexible(payload.TotalItems)
+		lastPerPage = atoiFlexible(payload.MaxPageItems)
 	} else {
 		// Some portals return a bare array in js
 		if err := json.Unmarshal(js, &rows); err != nil {
-			return nil, 0, fmt.Errorf("vod list: invalid js payload: %w", err)
+			return nil, 0, 0, fmt.Errorf("vod list: invalid js payload: %w", err)
 		}
 		total = len(rows)
 	}
@@ -365,9 +450,9 @@ func parseVODList(content []byte, prm vodListParams) ([]VODItem, int, error) {
 	for _, row := range rows {
 		id := strings.TrimSpace(fmt.Sprint(row.ID))
 		if id == "" || id == "<nil>" {
-			id = strings.TrimSpace(row.CMD)
+			id = strings.TrimSpace(string(row.CMD))
 		}
-		name := strings.TrimSpace(row.Name)
+		name := strings.TrimSpace(string(row.Name))
 		if name == "" {
 			continue
 		}
@@ -387,10 +472,26 @@ func parseVODList(content []byte, prm vodListParams) ([]VODItem, int, error) {
 		item := VODItem{
 			ID:           id,
 			Name:         name,
-			CMD:          strings.TrimSpace(row.CMD),
-			Logo:         strings.TrimSpace(row.Logo),
+			CMD:          strings.TrimSpace(string(row.CMD)),
+			Logo:         strings.TrimSpace(string(row.Logo)),
 			IsSeries:     fmt.Sprint(row.IsSeries),
-			ContainerExt: strings.TrimSpace(row.ContainerExt),
+			ContainerExt: strings.TrimSpace(string(row.ContainerExt)),
+		}
+		item.Description = strings.TrimSpace(string(row.Description))
+		item.Director = strings.TrimSpace(string(row.Director))
+		item.Actors = strings.TrimSpace(string(row.Actors))
+		item.Genres = strings.TrimSpace(string(row.GenresStr))
+		if y := strings.TrimSpace(string(row.Year)); y != "0" {
+			item.Year = y
+		}
+		if t, err := time.ParseInLocation("2006-01-02 15:04:05", strings.TrimSpace(string(row.Added)), time.UTC); err == nil {
+			item.Added = strconv.FormatInt(t.Unix(), 10)
+		}
+		for _, rs := range []string{string(row.RatingIMDB), string(row.RatingKP)} {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(rs), 64); err == nil && f > 0 {
+				item.Rating = strconv.FormatFloat(f, 'f', -1, 64)
+				break
+			}
 		}
 		if vid := strings.TrimSpace(fmt.Sprint(row.VideoID)); vid != "" && vid != "<nil>" {
 			item.MovieID = vid
@@ -412,7 +513,7 @@ func parseVODList(content []byte, prm vodListParams) ([]VODItem, int, error) {
 	if total == 0 {
 		total = len(out)
 	}
-	return out, total, nil
+	return out, total, lastPerPage, nil
 }
 
 func atoiFlexible(v interface{}) int {
@@ -490,17 +591,72 @@ func (p *Portal) CreateVODPlayLinkByID(streamID, linkType, seriesNum string) (*V
 	if streamID == "" {
 		return nil, fmt.Errorf("empty stream id")
 	}
+	if seriesNum == "" {
+		if fid := p.lookupMovieFileID(streamID); fid != "" {
+			return p.CreateVODPlayLink("/media/file_"+fid+".mpg", linkType, seriesNum)
+		}
+	}
 	cmd := "/media/file_" + streamID + ".mpg"
 	return p.CreateVODPlayLink(cmd, linkType, seriesNum)
+}
+
+// lookupMovieFileID resolves a movie id to its playable file id (the portal's
+// create_link wants /media/file_<fileid>.mpg, not the movie id).
+func (p *Portal) lookupMovieFileID(movieID string) string {
+	return p.lookupFileID(movieID, "", "")
+}
+
+// LookupEpisodeFileID resolves an episode to its playable file id.
+func (p *Portal) LookupEpisodeFileID(seriesID, seasonID, episodeID string) string {
+	return p.lookupFileID(seriesID, seasonID, episodeID)
+}
+
+func (p *Portal) lookupFileID(movieID, seasonID, episodeID string) string {
+	q := url.Values{}
+	q.Set("type", "vod")
+	q.Set("action", "get_ordered_list")
+	q.Set("movie_id", movieID)
+	if episodeID != "" {
+		q.Set("season_id", seasonID)
+		q.Set("episode_id", episodeID)
+	}
+	q.Set("JsHttpRequest", "1-xml")
+	content, err := p.httpRequest(p.Location + "?" + q.Encode())
+	if err != nil {
+		return ""
+	}
+	var raw struct {
+		Js struct {
+			Data []struct {
+				ID      flexString `json:"id"`
+				Status  flexString `json:"status"`
+				Quality flexString `json:"quality"`
+			} `json:"data"`
+		} `json:"js"`
+	}
+	if json.Unmarshal(content, &raw) != nil {
+		return ""
+	}
+	best, bestQ := "", -1
+	for _, f := range raw.Js.Data {
+		if st := strings.TrimSpace(string(f.Status)); st != "" && st != "1" {
+			continue
+		}
+		qv, _ := strconv.Atoi(strings.TrimSpace(string(f.Quality)))
+		if id := strings.TrimSpace(string(f.ID)); id != "" && qv > bestQ {
+			best, bestQ = id, qv
+		}
+	}
+	return best
 }
 
 func (p *Portal) parseCreateLinkVOD(content []byte, linkType string) (*VODPlayLink, error) {
 	var raw struct {
 		Js struct {
-			Cmd       string `json:"cmd"`
-			URL       string `json:"url"`
-			ID        string `json:"id"`
-			PlayToken string `json:"play_token"`
+			Cmd       string     `json:"cmd"`
+			URL       string     `json:"url"`
+			ID        flexString `json:"id"`
+			PlayToken flexString `json:"play_token"`
 		} `json:"js"`
 	}
 	if err := json.Unmarshal(content, &raw); err != nil {
@@ -509,11 +665,11 @@ func (p *Portal) parseCreateLinkVOD(content []byte, linkType string) (*VODPlayLi
 	if u := strings.TrimSpace(raw.Js.URL); u != "" {
 		return &VODPlayLink{URL: normalizeVODStreamURL(u), Type: linkType}, nil
 	}
-	streamFile := strings.TrimSpace(raw.Js.ID)
+	streamFile := strings.TrimSpace(string(raw.Js.ID))
 	if streamFile != "" && !strings.Contains(streamFile, ".") {
 		streamFile = streamFile + ".mp4"
 	}
-	token := strings.TrimSpace(raw.Js.PlayToken)
+	token := strings.TrimSpace(string(raw.Js.PlayToken))
 	rawCmd := strings.TrimSpace(raw.Js.Cmd)
 	if rawCmd != "" {
 		if u := extractStreamURL(rawCmd); strings.HasPrefix(strings.ToLower(u), "http") {
@@ -599,4 +755,23 @@ func extractStreamURL(cmd string) string {
 		return last
 	}
 	return cmd
+}
+
+// flexString decodes a JSON string or number (portals are inconsistent) into a string.
+type flexString string
+
+func (f *flexString) UnmarshalJSON(b []byte) error {
+	var v interface{}
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	switch t := v.(type) {
+	case string:
+		*f = flexString(t)
+	case float64:
+		*f = flexString(strconv.FormatFloat(t, 'f', -1, 64))
+	default:
+		*f = ""
+	}
+	return nil
 }

@@ -20,7 +20,11 @@ func (p *Portal) handshake() error {
 	}
 	var tmp tmpStruct
 
-	req, err := http.NewRequest("GET", p.Location+"?type=stb&action=handshake&token="+p.Token+"&JsHttpRequest=1-xml", nil)
+	handshakeURL := p.Location + "?type=stb&action=handshake&token=" + p.Token + "&JsHttpRequest=1-xml"
+	if replayEnabled() {
+		handshakeURL = p.replayHandshakeURL()
+	}
+	req, err := http.NewRequest("GET", handshakeURL, nil)
 	if err != nil {
 		return err
 	}
@@ -37,6 +41,10 @@ func (p *Portal) handshake() error {
 		req.Header.Set("Origin", u.Scheme+"://"+u.Host)
 	}
 
+	if replayEnabled() {
+		p.replayHeaders(req, false)
+	}
+
 	resp, err := HTTPClient.Do(req)
 	if err != nil {
 		return err
@@ -51,6 +59,10 @@ func (p *Portal) handshake() error {
 	if err = json.Unmarshal(contents, &tmp); err != nil {
 		log.Println(string(contents))
 		return err
+	}
+
+	if r, ok := tmp.Js["random"].(string); ok {
+		p.random = r
 	}
 
 	token, ok := tmp.Js["token"]
@@ -145,7 +157,11 @@ func (p *Portal) authenticateWithDeviceIDs() (err error) {
 	var tmp tmpStruct
 
 	log.Println("Authenticating with DeviceId and DeviceId2")
-	content, err := p.httpRequest(p.Location + "?type=stb&action=get_profile&JsHttpRequest=1-xml&hd=1&sn=" + p.SerialNumber + "&stb_type=" + p.Model + "&device_id=" + p.DeviceID + "&device_id2=" + p.DeviceID2 + "&auth_second_step=1")
+	link := p.Location + "?type=stb&action=get_profile&JsHttpRequest=1-xml&hd=1&sn=" + p.SerialNumber + "&stb_type=" + p.Model + "&device_id=" + p.DeviceID + "&device_id2=" + p.DeviceID2 + "&auth_second_step=1"
+	if replayEnabled() {
+		link = p.replayProfileURL(p.random)
+	}
+	content, err := p.httpRequestOnce(link)
 
 	if err != nil {
 		log.Println("HTTP authentication request failed")

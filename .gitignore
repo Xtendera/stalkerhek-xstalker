@@ -49,6 +49,7 @@ logs/
 
 stalkerhek.yml
 stalkerhek.yaml
+private_config.yml
 
 .env
 .env.*

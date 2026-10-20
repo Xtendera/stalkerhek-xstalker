@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,7 +27,7 @@ func (p *Portal) Start() error {
 		if err := p.authenticate(); err != nil {
 			return err
 		}
-	} else if p.DeviceIdAuth == true {
+	} else if p.DeviceIdAuth == true || replayEnabled() {
 		if err := p.authenticateWithDeviceIDs(); err != nil {
 			return err
 		}
@@ -54,7 +55,38 @@ func (p *Portal) Start() error {
 	return nil
 }
 
+var reauthMu sync.Mutex
+
+// httpRequest performs a portal request and transparently re-authenticates
+// (handshake + profile) once if the portal reports the session has expired.
 func (p *Portal) httpRequest(link string) ([]byte, error) {
+	b, err := p.httpRequestOnce(link)
+	if err != nil || !bytes.HasPrefix(bytes.TrimSpace(b), []byte("Authorization failed")) {
+		return b, err
+	}
+	reauthMu.Lock()
+	if time.Since(p.lastReauth) > 10*time.Second {
+		log.Println("Portal session expired, re-authenticating ...")
+		if err := p.handshake(); err != nil {
+			reauthMu.Unlock()
+			return nil, err
+		}
+		if p.Username != "" && p.Password != "" {
+			err = p.authenticate()
+		} else {
+			err = p.authenticateWithDeviceIDs()
+		}
+		p.lastReauth = time.Now()
+		if err != nil {
+			reauthMu.Unlock()
+			return nil, err
+		}
+	}
+	reauthMu.Unlock()
+	return p.httpRequestOnce(link)
+}
+
+func (p *Portal) httpRequestOnce(link string) ([]byte, error) {
 	req, err := http.NewRequest("GET", link, nil)
 	if err != nil {
 		return nil, err
@@ -75,6 +107,9 @@ func (p *Portal) httpRequest(link string) ([]byte, error) {
 	cookieText := "PHPSESSID=null; sn=" + url.QueryEscape(p.SerialNumber) + "; mac=" + url.QueryEscape(p.MAC) + "; stb_lang=en; timezone=" + url.QueryEscape(p.TimeZone) + ";"
 
 	req.Header.Set("Cookie", cookieText)
+	if replayEnabled() {
+		p.replayHeaders(req, true)
+	}
 
 	resp, err := HTTPClient.Do(req)
 	if err != nil {

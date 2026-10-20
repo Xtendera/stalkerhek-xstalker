@@ -31,7 +31,7 @@ type Config struct {
 
 // HTTPClient with connection pooling
 var HTTPClient = &http.Client{
-	Timeout: 30 * time.Second,
+	Timeout: 180 * time.Second,
 	Transport: &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -43,7 +43,7 @@ var HTTPClient = &http.Client{
 		MaxIdleConnsPerHost: 10,
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second,
+		ResponseHeaderTimeout: 180 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		DisableCompression:    true,
 	},
@@ -64,6 +64,8 @@ type Portal struct {
 	Token        string `yaml:"token"`
 	WatchDogTime int    `yaml:"watchdog"`
 	DeviceIdAuth bool   `yaml:"device_id_auth"`
+	random       string
+	lastReauth   time.Time
 }
 
 // ReadConfig returns configuration from the file in Portal object

@@ -22,6 +22,9 @@ func (p *Portal) FetchPortalMeta() (*PortalMeta, error) {
 		url.QueryEscape(p.SerialNumber) + "&stb_type=" + url.QueryEscape(p.Model) +
 		"&device_id=" + url.QueryEscape(p.DeviceID) + "&device_id2=" + url.QueryEscape(p.DeviceID2) +
 		"&auth_second_step=1"
+	if replayEnabled() {
+		link = p.replayProfileURL(p.random)
+	}
 	content, err := p.httpRequest(link)
 	if err != nil {
 		return nil, err

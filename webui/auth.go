@@ -154,7 +154,7 @@ func AuthMiddleware(next http.Handler) http.Handler {
 			"/api/auth/status", "/health", "/healthz", "/api/trusted-subnets", "/assets/banner.png"}
 		if strings.HasPrefix(r.URL.Path, "/epg/") || strings.HasPrefix(r.URL.Path, "/vod/") ||
 			strings.HasPrefix(r.URL.Path, "/xtream/") || strings.HasPrefix(r.URL.Path, "/movie/") ||
-			strings.HasPrefix(r.URL.Path, "/series/") || strings.HasPrefix(r.URL.Path, "/live/") ||
+			strings.HasPrefix(r.URL.Path, "/series/") || strings.HasPrefix(r.URL.Path, "/live/") || strings.HasPrefix(r.URL.Path, "/iptv/") || strings.HasPrefix(r.URL.Path, "/logo/") ||
 			r.URL.Path == "/player_api.php" || r.URL.Path == "/panel_api.php" {
 			next.ServeHTTP(w, r)
 			return
@@ -175,10 +175,14 @@ func AuthMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		// Check if any users exist - if not, allow access for initial setup
+		// No account yet: first-time setup is only possible from the local network,
+		// and the dashboard sends you to create the account instead of opening up.
 		if !hasUsers() {
-			if r.URL.Path == "/" || r.URL.Path == "/dashboard" ||
-			   strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/static/") {
+			if !isTrustedIP(r) {
+				http.Error(w, "dashboard setup is only available from the local network", http.StatusForbidden)
+				return
+			}
+			if strings.HasPrefix(r.URL.Path, "/static/") {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -207,12 +211,16 @@ func isTrustedIP(r *http.Request) bool {
 	if len(trustedSubnets) == 0 {
 		return false
 	}
-
-	ipStr := r.RemoteAddr
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		ipStr = strings.Split(fwd, ",")[0]
+	// A tunnel (ngrok, Cloudflare, nginx) on this machine connects from 127.0.0.1,
+	// which would look "local". Anything that carries proxy headers is treated
+	// as remote, so internet visitors never get the LAN bypass.
+	if viaProxy(r) {
+		return false
 	}
-	ipStr = strings.TrimSpace(ipStr)
+
+	// Only the real TCP peer counts. X-Forwarded-For is client-controlled, so
+	// honouring it would let anyone on the internet claim to be 192.168.x.x.
+	ipStr := strings.TrimSpace(r.RemoteAddr)
 	if host, _, err := net.SplitHostPort(ipStr); err == nil {
 		ipStr = host
 	}
@@ -704,6 +712,10 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 	// 2. No users exist yet (first setup), OR
 	// 3. Request is from an authenticated user (creating additional accounts)
 	isAuthenticated := isAuthenticated(r)
+	if !hasUsers() && !isTrustedIP(r) {
+		http.Error(w, "setup is only available from the local network", http.StatusForbidden)
+		return
+	}
 	if !allowRegistration && hasUsers() && !isAuthenticated {
 		http.Error(w, "registration disabled", http.StatusForbidden)
 		return

@@ -1,0 +1,75 @@
+# Stalkerhek configuration example
+#
+# Copy this file to `stalkerhek.yml` and fill in your own values.
+# `stalkerhek.yml` is git-ignored, so your real credentials stay local.
+#
+#   cp stalkerhek.example.yml stalkerhek.yml
+#
+# Treat this data as sensitive: portal URLs, MAC addresses, device IDs and
+# password hashes can be used to access your IPTV account.
+
+auth:
+  your_username:
+    username: "your_username"
+    password_hash: "$2a$10$REPLACE_WITH_BCRYPT_HASH"
+    security_question: "Your security question?"
+    security_answer_hash: "$2a$10$REPLACE_WITH_BCRYPT_HASH"
+    created_at: "1970-01-01T00:00:00Z"
+    last_login: "1970-01-01T00:00:00Z"
+
+profiles:
+  - id: 1
+    name: "my-portal"
+    portal_url: "http://portal.example.com/stalker_portal/server/load.php"
+    mac: "00:1A:79:00:00:00"
+    hls_port: 4600
+    proxy_port: 4800
+    model: "MAG254"
+    serial_number: "0000000000000"
+    time_zone: "UTC"
+    watchdog_time: 5
+    device_id: ""
+    device_id2: ""
+    signature: ""
+    username: ""
+    password: ""
+    epg_url: ""
+
+filters:
+  mode: "languages"
+
+# Hardware identifiers. Leave empty to use the application defaults.
+hardware:
+  device_id: ""
+  device_id2: ""
+  signature: ""
+
+security:
+  # Generated at runtime; do not commit real tokens.
+  password_reset_tokens: {}
+  session_tokens: {}
+  generated_tokens: {}
+
+runtime:
+  last_update: ""
+  version: "1.0"
+  env_vars:
+    STALKERHEK_WEBUI_GZIP: ""
+    STALKERHEK_ROOT: ""
+    STALKERHEK_PROFILES_FILE: ""
+    STALKERHEK_AUTH_FILE: ""
+    STALKERHEK_TRUSTED_SUBNETS: ""
+    STALKERHEK_DISABLE_AUTH: ""
+    STALKERHEK_ALLOW_REGISTER: ""
+    STALKERHEK_RESTART_HOURS: ""
+    STALKERHEK_STBEMU_REPLAY: ""
+    STALKERHEK_STBEMU_ADID: ""
+    STALKERHEK_STBEMU_HWVER: ""
+    STALKERHEK_STBEMU_HW2: ""
+    STALKERHEK_STBEMU_PREHASH: ""
+
+  system:
+    timezone: "UTC"
+    default_ports:
+      hls: 7770
+      proxy: 7700

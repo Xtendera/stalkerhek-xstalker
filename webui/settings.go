@@ -14,7 +14,7 @@ import (
 // Tuned for stability over minimum latency (see README Advanced settings).
 var DefaultRuntimeSettings = RuntimeSettings{
 	PlaylistDelaySegments:        5,
-	ResponseHeaderTimeoutSeconds: 35,
+	ResponseHeaderTimeoutSeconds: 180,
 	MaxIdleConnsPerHost:          128,
 	HLSChannelLinkTTLSeconds:     180,
 	MediaChannelLinkTTLSeconds:   45,
