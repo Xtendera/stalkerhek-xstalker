@@ -7,12 +7,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/kidpoleon/stalkerhek/stalker"
 )
 
 // VOD language filter: restricts movie/series categories exposed over the
-// Xtream API to English, Hindi and Gujarati ones. Toggled from the dashboard.
+// Xtream API to those whose title starts with English, Hindi or Gujarati. Toggled from the dashboard.
 const (
 	vodFilterAll       = "all"
 	vodFilterLanguages = "languages"
@@ -73,6 +74,16 @@ func setVODFilterMode(mode string) {
 	LogInfo("SETTINGS", "vod filter mode=%s", mode)
 }
 
+// vodFilterFirstWord returns the upper-cased first word of a category title, so
+// "TAMIL DUB | ENGLISH MOVIES" is judged as TAMIL, not by the ENGLISH after it.
+func vodFilterFirstWord(title string) string {
+	f := strings.FieldsFunc(strings.ToUpper(title), func(r rune) bool { return !unicode.IsLetter(r) })
+	if len(f) == 0 {
+		return ""
+	}
+	return f[0]
+}
+
 // filterVODCategories drops categories outside the wanted languages when the
 // filter is on. The "*" pseudo-category is always kept.
 func filterVODCategories(cats []stalker.VODCategory) []stalker.VODCategory {
@@ -81,10 +92,10 @@ func filterVODCategories(cats []stalker.VODCategory) []stalker.VODCategory {
 	}
 	out := make([]stalker.VODCategory, 0, len(cats))
 	for _, c := range cats {
-		t := strings.ToUpper(c.Title)
+		first := vodFilterFirstWord(c.Title)
 		keep := c.ID == "*"
 		for _, k := range vodFilterKeywords {
-			if strings.Contains(t, k) {
+			if first == k {
 				keep = true
 				break
 			}

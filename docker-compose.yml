@@ -9,6 +9,10 @@ services:
     # NOTE: Host networking works on Linux. On Docker Desktop (Windows/macOS), use the bridge-mode example below.
     network_mode: host
 
+    # All configuration comes from environment variables. Put secrets in .env
+    # (git-ignored; see .env.example) - nothing sensitive belongs in this file.
+    env_file:
+      - .env
     environment:
       - STALKERHEK_PROFILES_FILE=/data/profiles.json
       - STALKERHEK_AUTH_FILE=/data/auth.json

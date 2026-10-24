@@ -56,6 +56,10 @@ func main() {
 		log.Printf("failed to load profiles: %v", err)
 	}
 
+	if n := webui.LoadProfilesFromEnv(); n > 0 {
+		log.Printf("Loaded %d profile(s) from environment", n)
+	}
+
 	// Start WebUI and keep it running
 	log.Println("Starting WebUI on :4400 ...")
 	go webui.StartWithContext(ctx, c, make(chan struct{})) // ready ignored
